@@ -263,19 +263,29 @@ def handle_client(client_socket: socket.socket, client_address: tuple) -> None:
         client_address: Client address tuple (IP, port)
     """
     try:
-        # Set a reasonable timeout for receiving data
-        client_socket.settimeout(30)
+        # Set longer timeout for very large file uploads (5 minutes max)
+        client_socket.settimeout(300)
         
-        # Receive the request
+        # Receive the request - keep reading until client closes connection
         request_data = b""
+        consecutive_timeouts = 0
+        
         while True:
             try:
-                chunk = client_socket.recv(4096)
+                chunk = client_socket.recv(16384)  # 16KB buffer for faster reception
                 if not chunk:
+                    # Client closed connection - we got all the data
                     break
                 request_data += chunk
+                consecutive_timeouts = 0  # Reset timeout counter
             except socket.timeout:
-                break
+                consecutive_timeouts += 1
+                # After 3 consecutive timeouts with data received, assume done
+                if consecutive_timeouts >= 3 and request_data:
+                    break
+                # If no data at all and timeout, give up
+                if not request_data and consecutive_timeouts >= 2:
+                    break
         
         if not request_data:
             client_socket.close()
@@ -298,13 +308,21 @@ def handle_client(client_socket: socket.socket, client_address: tuple) -> None:
             else:
                 response = f"ERROR: Unknown command type '{command_type}'"
         
-        # Send response
-        client_socket.sendall(response.encode('utf-8'))
+        # Send response back to client
+        response_bytes = response.encode('utf-8')
+        client_socket.sendall(response_bytes)
+        
+        # Gracefully close the connection
+        try:
+            client_socket.shutdown(socket.SHUT_RDWR)
+        except:
+            pass
     
     except Exception as e:
         try:
             error_msg = f"ERROR: Server error: {e}"
-            client_socket.sendall(error_msg.encode('utf-8'))
+            error_bytes = error_msg.encode('utf-8')
+            client_socket.sendall(error_bytes)
         except:
             pass
     
@@ -315,7 +333,7 @@ def handle_client(client_socket: socket.socket, client_address: tuple) -> None:
             pass
 
 
-def start_server(host: str = 'localhost', port: int = 65432) -> None:
+def start_server(host: str = 'localhost', port: int = 8080) -> None:
     """
     Start the syslog server and listen for client connections.
     
@@ -364,7 +382,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         port = int(sys.argv[1])
     else:
-        port = 65432
+        port = 8080
     
     if len(sys.argv) > 2:
         host = sys.argv[2]

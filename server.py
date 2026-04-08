@@ -142,12 +142,10 @@ def handle_upload(sock: socket.socket, header_line: str) -> str:
 
                     line_buffer += chunk_text
 
-                    # Split into lines; keep last incomplete line buffered
-                    lines = line_buffer.split('\n')
-                    line_buffer = lines[-1]  # Last element is incomplete
-
-                    # Process all complete lines (all but the last one)
-                    for line in lines[:-1]:
+                    # Process complete lines (split by newline)
+                    while "\n" in line_buffer:
+                        line, line_buffer = line_buffer.split("\n", 1)
+                        
                         if not line.strip():
                             continue
 

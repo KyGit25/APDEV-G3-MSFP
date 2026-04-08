@@ -14,8 +14,8 @@ class SyslogClient:
     """Client for communicating with the syslog analytics server."""
     
     def __init__(self):
-        self.server_ip = None
-        self.server_port = None
+        self.server_ip = "103.231.240.136"
+        self.server_port = 11304
     
     def parse_address(self, address: str) -> Tuple[str, int]:
         """
@@ -125,17 +125,17 @@ class SyslogClient:
         """
         INGEST command: Upload a syslog file to the server.
         
-        Usage: INGEST <file_path> <IP>:<Port>
+        Usage: INGEST <file_path> [IP:Port]
         
         Args:
             args: Command arguments
         """
-        if len(args) < 2:
-            print("[Error] INGEST command requires: INGEST <file_path> <IP>:<Port>")
+        if len(args) < 1:
+            print("[Error] INGEST command requires: INGEST <file_path> [IP:Port]")
             return
         
         file_path = args[0]
-        address = args[1]
+        address = args[1] if len(args) > 1 else f"{self.server_ip}:{self.server_port}"
         
         # Validate file exists
         if not os.path.exists(file_path):
@@ -189,15 +189,15 @@ class SyslogClient:
         """
         QUERY command: Execute search and count operations on the server.
         
-        Usage: QUERY <IP>:<Port> <SEARCH_TYPE> <filter_value>
+        Usage: QUERY <SEARCH_TYPE> <filter_value> [IP:Port]
         Supported search types: SEARCH_DATE, SEARCH_HOST, SEARCH_DAEMON, 
                                SEARCH_SEVERITY, SEARCH_KEYWORD, COUNT_KEYWORD
         
         Args:
             args: Command arguments
         """
-        if len(args) < 3:
-            print("[Error] QUERY command requires: QUERY <IP>:<Port> <SEARCH_TYPE> <value>")
+        if len(args) < 2:
+            print("[Error] QUERY command requires: QUERY <SEARCH_TYPE> <value> [IP:Port]")
             print("Supported search types:")
             print("  - SEARCH_DATE <date_string>")
             print("  - SEARCH_HOST <hostname>")
@@ -207,9 +207,15 @@ class SyslogClient:
             print("  - COUNT_KEYWORD <keyword>")
             return
         
-        address = args[0]
-        search_type = args[1].upper()
-        filter_value = ' '.join(args[2:])  # Join remaining args for multi-word filters
+        search_type = args[0].upper()
+        # Find if last arg is an IP:Port format or part of filter value
+        potential_address = args[-1]
+        if ':' in potential_address and len(args) > 2:
+            address = args[-1]
+            filter_value = ' '.join(args[1:-1])
+        else:
+            address = f"{self.server_ip}:{self.server_port}"
+            filter_value = ' '.join(args[1:])  # Join remaining args for multi-word filters
         
         # Validate search type
         valid_types = ['SEARCH_DATE', 'SEARCH_HOST', 'SEARCH_DAEMON', 
@@ -251,16 +257,12 @@ class SyslogClient:
         """
         PURGE command: Delete all indexed logs from the server.
         
-        Usage: PURGE <IP>:<Port>
+        Usage: PURGE [IP:Port]
         
         Args:
             args: Command arguments
         """
-        if len(args) < 1:
-            print("[Error] PURGE command requires: PURGE <IP>:<Port>")
-            return
-        
-        address = args[0]
+        address = args[0] if len(args) > 0 else f"{self.server_ip}:{self.server_port}"
         
         try:
             # Parse server address
@@ -293,11 +295,13 @@ class SyslogClient:
     def print_help(self) -> None:
         """Print help message."""
         print("\n=== Mini-Splunk Syslog Analytics Client ===\n")
+        print(f"Default Server: {self.server_ip}:{self.server_port}\n")
         print("Available Commands:\n")
-        print("1. INGEST <file_path> <IP>:<Port>")
+        print("1. INGEST <file_path> [IP:Port]")
         print("   Upload and parse a local syslog file to the server")
+        print("   Example: INGEST /var/log/syslog")
         print("   Example: INGEST /var/log/syslog 192.168.1.100:65432\n")
-        print("2. QUERY <IP>:<Port> <SEARCH_TYPE> <filter>")
+        print("2. QUERY <SEARCH_TYPE> <filter> [IP:Port]")
         print("   Execute search and count operations")
         print("   Search types:")
         print("     - SEARCH_DATE <date_string>    (e.g., 'Feb 22')")
@@ -307,10 +311,12 @@ class SyslogClient:
         print("     - SEARCH_KEYWORD <keyword>     (e.g., 'Failed password')")
         print("     - COUNT_KEYWORD <keyword>      (e.g., 'Deactivated')")
         print("   Examples:")
-        print("     QUERY 192.168.1.100:65432 SEARCH_DATE Feb 22")
-        print("     QUERY 192.168.1.100:65432 SEARCH_HOST SYSSVR1\n")
-        print("3. PURGE <IP>:<Port>")
+        print("     QUERY SEARCH_DATE Feb 22")
+        print("     QUERY SEARCH_HOST SYSSVR1")
+        print("     QUERY SEARCH_HOST SYSSVR1 192.168.1.100:65432\n")
+        print("3. PURGE [IP:Port]")
         print("   Delete all indexed logs from the server")
+        print("   Example: PURGE")
         print("   Example: PURGE 192.168.1.100:65432\n")
         print("4. HELP")
         print("   Show this help message\n")

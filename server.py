@@ -77,16 +77,6 @@ def recv_until_newline(sock: socket.socket) -> bytes:
     return data
 
 
-def recv_exact(sock: socket.socket, total_bytes: int) -> bytes:
-    data = bytearray()
-    while len(data) < total_bytes:
-        chunk = sock.recv(min(8192, total_bytes - len(data)))
-        if not chunk:
-            break
-        data.extend(chunk)
-    return bytes(data)
-
-
 def handle_upload(sock: socket.socket, header_line: str) -> str:
     try:
         parts = header_line.strip().split("|")
@@ -94,24 +84,62 @@ def handle_upload(sock: socket.socket, header_line: str) -> str:
             return "ERROR: Invalid upload header"
 
         _, file_size_str = parts
-        file_size = int(file_size_str)
+        expected_size = int(file_size_str)
 
-        file_bytes = recv_exact(sock, file_size)
+        bytes_received = 0
+        indexed_count = 0
+        buffer = b""
 
-        if len(file_bytes) != file_size:
-            return f"ERROR: Incomplete file received. Expected {file_size} bytes, got {len(file_bytes)} bytes."
+        while bytes_received < expected_size:
+            chunk = sock.recv(min(8192, expected_size - bytes_received))
+            if not chunk:
+                break
 
-        content = file_bytes.decode("utf-8", errors="replace")
-        parsed_logs = parse_syslog(content)
+            bytes_received += len(chunk)
+            buffer += chunk
 
-        if not parsed_logs:
-            return "ERROR: No valid syslog entries found in file"
+            while b"\n" in buffer:
+                line_bytes, buffer = buffer.split(b"\n", 1)
+                line = line_bytes.decode("utf-8", errors="replace").rstrip("\r")
+
+                if not line.strip():
+                    continue
+
+                parsed_logs = parse_syslog(line)
+
+                if parsed_logs:
+                    with STATE_LOCK:
+                        LOG_STORAGE.extend(parsed_logs)
+                    indexed_count += len(parsed_logs)
+
+        # If upload fully completed and leftover buffer contains a final line
+        # without trailing newline, try parsing it too.
+        if bytes_received == expected_size and buffer.strip():
+            line = buffer.decode("utf-8", errors="replace").rstrip("\r")
+            parsed_logs = parse_syslog(line)
+
+            if parsed_logs:
+                with STATE_LOCK:
+                    LOG_STORAGE.extend(parsed_logs)
+                indexed_count += len(parsed_logs)
 
         with STATE_LOCK:
-            LOG_STORAGE.extend(parsed_logs)
             total_count = len(LOG_STORAGE)
 
-        return f"SUCCESS: File received and {len(parsed_logs)} syslog entries parsed and indexed. Total entries: {total_count}"
+        if bytes_received == expected_size:
+            return (
+                f"SUCCESS: Streaming upload complete. "
+                f"Received {bytes_received} of {expected_size} bytes. "
+                f"Indexed {indexed_count} log entries. "
+                f"Total entries: {total_count}"
+            )
+
+        return (
+            f"WARNING: Upload interrupted. "
+            f"Received {bytes_received} of {expected_size} bytes. "
+            f"Indexed {indexed_count} log entries before interruption. "
+            f"Total entries: {total_count}"
+        )
 
     except Exception as e:
         return f"ERROR: Failed to process upload: {e}"
@@ -237,7 +265,7 @@ def handle_client(client_socket: socket.socket, client_address: tuple) -> None:
             pass
 
 
-def start_server(host: str = "127.0.0.1", port: int = 5000) -> None:
+def start_server(host: str = "0.0.0.0", port: int = 8080) -> None:
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
@@ -269,7 +297,7 @@ def start_server(host: str = "127.0.0.1", port: int = 5000) -> None:
 
 if __name__ == "__main__":
     try:
-        port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
+        port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
         host = sys.argv[2] if len(sys.argv) > 2 else "0.0.0.0"
         start_server(host, port)
     except ValueError:

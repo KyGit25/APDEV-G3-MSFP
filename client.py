@@ -86,21 +86,38 @@ class SyslogClient:
             Server response
         """
         try:
+            # Send the complete command
             sock.sendall(command.encode('utf-8'))
             
-            # Receive response in chunks
+            # Signal that we're done sending - close write side
+            try:
+                sock.shutdown(socket.SHUT_WR)
+            except:
+                pass
+            
+            # Now receive response with robust timeout handling
             response = b""
-            sock.settimeout(10)
+            sock.settimeout(120)  # 2 minutes to receive response
+            
             while True:
                 try:
-                    chunk = sock.recv(4096)
+                    chunk = sock.recv(16384)  # 16KB buffer
                     if not chunk:
+                        # Server closed connection - we got all data
                         break
                     response += chunk
                 except socket.timeout:
+                    # Timeout while waiting for data - we got what we could
+                    break
+                except Exception as e:
+                    # Connection issues
                     break
             
-            return response.decode('utf-8', errors='replace')
+            result = response.decode('utf-8', errors='replace')
+            if not result:
+                return "ERROR: No response from server - file may not have been processed"
+            return result
+            
         except Exception as e:
             raise Exception(f"Communication error: {e}")
     
@@ -135,6 +152,7 @@ class SyslogClient:
             
             # Read file
             print("[System Message] Reading local file...")
+            sys.stdout.flush()
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 file_content = f.read()
             
@@ -143,10 +161,12 @@ class SyslogClient:
             
             # Connect to server
             print(f"[System Message] Connecting to {ip}:{port}...")
+            sys.stdout.flush()
             sock = self.connect_to_server(ip, port)
             
             # Build protocol message: UPLOAD|<filesize>|<file_content>
             print(f"[System Message] Uploading syslog ({file_size_mb:.1f} MB)...")
+            sys.stdout.flush()
             command = f"UPLOAD|{file_size}|{file_content}"
             
             # Send and receive
@@ -154,6 +174,7 @@ class SyslogClient:
             sock.close()
             
             print(f"[Server Response] {response}")
+            sys.stdout.flush()
         
         except ValueError as e:
             print(f"[Error] {e}")
@@ -161,6 +182,8 @@ class SyslogClient:
             print(f"[Error] {e}")
         except Exception as e:
             print(f"[Error] {e}")
+        
+        sys.stdout.flush()
     
     def cmd_query(self, args: list) -> None:
         """
@@ -202,6 +225,7 @@ class SyslogClient:
             
             # Connect to server
             print("[System Message] Sending query...")
+            sys.stdout.flush()
             sock = self.connect_to_server(ip, port)
             
             # Build protocol message: QUERY|<search_type>|<filter_value>
@@ -212,6 +236,7 @@ class SyslogClient:
             sock.close()
             
             print(f"[Server Response] {response}")
+            sys.stdout.flush()
         
         except ValueError as e:
             print(f"[Error] {e}")
@@ -219,6 +244,8 @@ class SyslogClient:
             print(f"[Error] {e}")
         except Exception as e:
             print(f"[Error] {e}")
+        
+        sys.stdout.flush()
     
     def cmd_purge(self, args: list) -> None:
         """
@@ -241,6 +268,7 @@ class SyslogClient:
             
             # Connect to server
             print(f"[System Message] Connecting to {ip}:{port} to purge records...")
+            sys.stdout.flush()
             sock = self.connect_to_server(ip, port)
             
             # Build protocol message: ADMIN|PURGE|NONE
@@ -251,6 +279,7 @@ class SyslogClient:
             sock.close()
             
             print(f"[Server Response] {response}")
+            sys.stdout.flush()
         
         except ValueError as e:
             print(f"[Error] {e}")
@@ -258,6 +287,8 @@ class SyslogClient:
             print(f"[Error] {e}")
         except Exception as e:
             print(f"[Error] {e}")
+        
+        sys.stdout.flush()
     
     def print_help(self) -> None:
         """Print help message."""
@@ -312,16 +343,20 @@ class SyslogClient:
                     self.print_help()
                 elif command == "EXIT":
                     print("[System Message] Goodbye!")
+                    sys.stdout.flush()
                     break
                 else:
                     print(f"[Error] Unknown command: {command}")
                     print("[System Message] Type 'HELP' for available commands")
+                    sys.stdout.flush()
             
             except KeyboardInterrupt:
                 print("\n[System Message] Goodbye!")
+                sys.stdout.flush()
                 break
             except Exception as e:
                 print(f"[Error] Unexpected error: {e}")
+                sys.stdout.flush()
 
 
 def main():

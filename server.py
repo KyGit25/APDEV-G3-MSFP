@@ -1,141 +1,276 @@
 #!/usr/bin/env python3
+
 import socket
 import threading
 import re
-import traceback
+import sys
+from typing import List, Dict
 
-# ==============================
-# Global Shared State & Lock
-# ==============================
-LOG_STORAGE = []
+LOG_STORAGE: List[Dict[str, str]] = []
 STATE_LOCK = threading.RLock()
 
-# ==============================
-# Regex Parser (RFC 3164/5424 hybrid)
-# ==============================
-# Example log: Feb  7 16:03:34 SYSSVR1 sshd[1032662]: Accepted password for user...
-SYSLOG_REGEX = re.compile(
-    r'(?P<timestamp>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+'
-    r'(?P<hostname>[A-Za-z0-9\-_]+)\s+'
-    r'(?P<daemon>[A-Za-z0-9\-\_\/]+)(?:\[\d+\])?:\s+'
-    r'(?P<message>.*)'
+SYSLOG_PATTERN = re.compile(
+    r"^"
+    r"(?P<timestamp>\w+\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+"
+    r"(?P<hostname>\S+)\s+"
+    r"(?P<daemon>[^\s:]+(?:\[\d+\])?)"
+    r":\s*"
+    r"(?P<message>.*)$"
 )
 
+SEVERITY_KEYWORDS = {
+    "ERROR": ["error", "failed", "fatal", "critical", "exception", "panic"],
+    "WARN": ["warn", "warning", "deprecated", "invalid"],
+    "INFO": ["info", "started", "stopped", "opened", "closed", "accepted"],
+}
+
+
 def infer_severity(message: str) -> str:
-    msg_upper = message.upper()
-    if "ERROR" in msg_upper or "FAIL" in msg_upper:
-        return "ERROR"
-    elif "WARN" in msg_upper or "INVALID" in msg_upper:
-        return "WARN"
-    else:
-        return "INFO"
+    msg = message.lower()
 
-def parse_syslog(content: str):
-    parsed_entries = []
+    for word in SEVERITY_KEYWORDS["ERROR"]:
+        if word in msg:
+            return "ERROR"
+    for word in SEVERITY_KEYWORDS["WARN"]:
+        if word in msg:
+            return "WARN"
+    for word in SEVERITY_KEYWORDS["INFO"]:
+        if word in msg:
+            return "INFO"
+
+    return "INFO"
+
+
+def parse_syslog(content: str) -> List[Dict[str, str]]:
+    parsed_logs = []
+
     for line in content.splitlines():
-        line = line.strip()
-        if not line:
+        if not line.strip():
             continue
-        m = SYSLOG_REGEX.match(line)
-        if m:
-            entry = m.groupdict()
-            entry["severity"] = infer_severity(entry["message"])
-            parsed_entries.append(entry)
-    return parsed_entries
 
-# ==============================
-# Query Engine
-# ==============================
-def query_engine(command, value):
-    if command == "SEARCH_DATE":
-        return [e for e in LOG_STORAGE if e["timestamp"].startswith(value)]
-    elif command == "SEARCH_HOST":
-        return [e for e in LOG_STORAGE if e["hostname"] == value]
-    elif command == "SEARCH_DAEMON":
-        return [e for e in LOG_STORAGE if e["daemon"] == value]
-    elif command == "SEARCH_SEVERITY":
-        return [e for e in LOG_STORAGE if e["severity"] == value.upper()]
-    elif command == "SEARCH_KEYWORD":
-        return [e for e in LOG_STORAGE if value in e["message"]]
-    elif command == "COUNT_KEYWORD":
-        count = sum(value in e["message"] for e in LOG_STORAGE)
-        return count
-    else:
-        return []
+        match = SYSLOG_PATTERN.match(line)
+        if not match:
+            continue
 
-def format_results(command, results, filter_val):
-    if command == "COUNT_KEYWORD":
-        return f"The keyword '{filter_val}' appears {results} times."
-    if not results:
-        return f"No matching entries found for {filter_val}"
-    lines = [f"Found {len(results)} matching entries for {filter_val}:"]
-    for i, e in enumerate(results, 1):
-        lines.append(f"{i}. {e['timestamp']} {e['hostname']} {e['daemon']}: {e['message']}")
-    return "\n".join(lines)
+        daemon_full = match.group("daemon")
+        daemon_name = re.sub(r"\[\d+\]", "", daemon_full)
 
-# ==============================
-# Client Handler Thread
-# ==============================
-def handle_client(conn, addr):
+        parsed_logs.append({
+            "timestamp": match.group("timestamp"),
+            "hostname": match.group("hostname"),
+            "daemon": daemon_name,
+            "severity": infer_severity(match.group("message")),
+            "message": match.group("message"),
+            "raw_line": line
+        })
+
+    return parsed_logs
+
+
+def recv_until_newline(sock: socket.socket) -> bytes:
+    data = b""
+    while b"\n" not in data:
+        chunk = sock.recv(1)
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def recv_exact(sock: socket.socket, total_bytes: int) -> bytes:
+    data = bytearray()
+    while len(data) < total_bytes:
+        chunk = sock.recv(min(8192, total_bytes - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+    return bytes(data)
+
+
+def handle_upload(sock: socket.socket, header_line: str) -> str:
     try:
-        request = conn.recv(10 * 1024 * 1024).decode(errors='replace')
+        parts = header_line.strip().split("|")
+        if len(parts) != 2:
+            return "ERROR: Invalid upload header"
+
+        _, file_size_str = parts
+        file_size = int(file_size_str)
+
+        file_bytes = recv_exact(sock, file_size)
+
+        if len(file_bytes) != file_size:
+            return f"ERROR: Incomplete file received. Expected {file_size} bytes, got {len(file_bytes)} bytes."
+
+        content = file_bytes.decode("utf-8", errors="replace")
+        parsed_logs = parse_syslog(content)
+
+        if not parsed_logs:
+            return "ERROR: No valid syslog entries found in file"
+
+        with STATE_LOCK:
+            LOG_STORAGE.extend(parsed_logs)
+            total_count = len(LOG_STORAGE)
+
+        return f"SUCCESS: File received and {len(parsed_logs)} syslog entries parsed and indexed. Total entries: {total_count}"
+
+    except Exception as e:
+        return f"ERROR: Failed to process upload: {e}"
+
+
+def handle_query(request: str) -> str:
+    try:
         parts = request.split("|")
-        cmdtype = parts[0]
+        if len(parts) < 3:
+            return "ERROR: Invalid QUERY command"
 
-        if cmdtype == "UPLOAD":
-            filesize = parts[1]
-            file_content = "|".join(parts[2:])
-            with STATE_LOCK:
-                parsed = parse_syslog(file_content)
-                LOG_STORAGE.extend(parsed)
-            conn.sendall(f"SUCCESS: File received and {len(parsed)} syslog entries parsed and indexed.".encode())
+        _, subcommand, filter_value = parts[0], parts[1].upper(), "|".join(parts[2:])
 
-        elif cmdtype == "QUERY":
-            subcmd = parts[1]
-            filter_val = parts[2]
-            with STATE_LOCK:
-                results = query_engine(subcmd, filter_val)
-            conn.sendall(format_results(subcmd, results, filter_val).encode())
+        with STATE_LOCK:
+            logs_copy = LOG_STORAGE.copy()
 
-        elif cmdtype == "ADMIN":
-            action = parts[1]
-            if action == "PURGE":
-                with STATE_LOCK:
-                    count = len(LOG_STORAGE)
-                    LOG_STORAGE.clear()
-                conn.sendall(f"SUCCESS: {count} indexed log entries have been erased.".encode())
-            else:
-                conn.sendall(b"UNKNOWN ADMIN REQUEST")
+        if subcommand == "SEARCH_DATE":
+            results = [log for log in logs_copy if log["timestamp"].startswith(filter_value)]
+            label = "date"
+
+        elif subcommand == "SEARCH_HOST":
+            results = [log for log in logs_copy if log["hostname"].lower() == filter_value.lower()]
+            label = "host"
+
+        elif subcommand == "SEARCH_DAEMON":
+            results = [log for log in logs_copy if log["daemon"].lower() == filter_value.lower()]
+            label = "daemon"
+
+        elif subcommand == "SEARCH_SEVERITY":
+            results = [log for log in logs_copy if log["severity"].upper() == filter_value.upper()]
+            label = "severity"
+
+        elif subcommand == "SEARCH_KEYWORD":
+            results = [log for log in logs_copy if filter_value.lower() in log["message"].lower()]
+            label = "keyword"
+
+        elif subcommand == "COUNT_KEYWORD":
+            count = sum(1 for log in logs_copy if filter_value.lower() in log["message"].lower())
+            return f"The keyword '{filter_value}' appears in {count} indexed log entry/entries."
 
         else:
-            conn.sendall(b"ERROR: Unknown Command Type")
+            return f"ERROR: Unknown query subcommand '{subcommand}'"
 
-    except Exception:
-        err = traceback.format_exc()
-        conn.sendall(f"SERVER ERROR:\n{err}".encode())
-    finally:
-        conn.close()
+        if not results:
+            return f"Found 0 matching entries for {label} '{filter_value}'"
 
-# ==============================
-# Server Loop
-# ==============================
-def start_server(ip="0.0.0.0", port=8080):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((ip, port))
-    s.listen(10)
-    print(f"[+] Mini-Splunk Server listening on {ip}:{port}")
+        preview = results[:50]
+        response = f"Found {len(results)} matching entries for {label} '{filter_value}':\n"
+        for i, log in enumerate(preview, 1):
+            response += f"{i}. {log['raw_line']}\n"
 
-    while True:
+        if len(results) > 50:
+            response += f"... showing first 50 of {len(results)} results"
+
+        return response.strip()
+
+    except Exception as e:
+        return f"ERROR: Query execution failed: {e}"
+
+
+def handle_admin(request: str) -> str:
+    try:
+        parts = request.split("|")
+        if len(parts) < 2:
+            return "ERROR: Invalid ADMIN command"
+
+        operation = parts[1].upper()
+
+        if operation == "PURGE":
+            with STATE_LOCK:
+                removed = len(LOG_STORAGE)
+                LOG_STORAGE.clear()
+            return f"SUCCESS: {removed} indexed log entries have been erased."
+
+        return f"ERROR: Unknown admin operation '{operation}'"
+
+    except Exception as e:
+        return f"ERROR: Admin command failed: {e}"
+
+
+def handle_client(client_socket: socket.socket, client_address: tuple) -> None:
+    try:
+        client_socket.settimeout(300)
+
+        first_line = recv_until_newline(client_socket)
+        if not first_line:
+            client_socket.close()
+            return
+
+        decoded_first_line = first_line.decode("utf-8", errors="replace")
+
+        if decoded_first_line.startswith("UPLOAD|"):
+            response = handle_upload(client_socket, decoded_first_line)
+
+        else:
+            remaining = b""
+            while True:
+                chunk = client_socket.recv(4096)
+                if not chunk:
+                    break
+                remaining += chunk
+
+            full_request = decoded_first_line + remaining.decode("utf-8", errors="replace")
+
+            if full_request.startswith("QUERY|"):
+                response = handle_query(full_request)
+            elif full_request.startswith("ADMIN|"):
+                response = handle_admin(full_request)
+            else:
+                response = "ERROR: Unknown command type"
+
+        client_socket.sendall(response.encode("utf-8"))
+
+    except Exception as e:
         try:
-            conn, addr = s.accept()
-            t = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-            t.start()
-        except KeyboardInterrupt:
-            print("\nServer shutting down.")
-            break
+            client_socket.sendall(f"ERROR: Server error: {e}".encode("utf-8"))
         except Exception:
-            traceback.print_exc()
+            pass
+    finally:
+        try:
+            client_socket.close()
+        except Exception:
+            pass
+
+
+def start_server(host: str = "127.0.0.1", port: int = 5000) -> None:
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    try:
+        server_socket.bind((host, port))
+        server_socket.listen(20)
+        print(f"[Server] Listening on {host}:{port}")
+        print("[Server] Waiting for client connections...")
+
+        while True:
+            client_socket, client_address = server_socket.accept()
+            print(f"[Server] New client connected from {client_address[0]}:{client_address[1]}")
+
+            thread = threading.Thread(
+                target=handle_client,
+                args=(client_socket, client_address),
+                daemon=True
+            )
+            thread.start()
+
+    except KeyboardInterrupt:
+        print("\n[Server] Shutting down...")
+    except OSError as e:
+        print(f"[Server] Failed to bind to {host}:{port}: {e}")
+    finally:
+        server_socket.close()
+        print("[Server] Server stopped")
+
 
 if __name__ == "__main__":
-    start_server()
+    try:
+        port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
+        host = sys.argv[2] if len(sys.argv) > 2 else "0.0.0.0"
+        start_server(host, port)
+    except ValueError:
+        print("[Server] Invalid port number")

@@ -215,6 +215,7 @@ def handle_upload(sock: socket.socket, header_line: str) -> str:
 
 def handle_query(request: str) -> str:
     try:
+        request = request.strip()  # Remove newline
         parts = request.split("|")
         if len(parts) < 3:
             return "ERROR: Invalid QUERY command"
@@ -270,6 +271,7 @@ def handle_query(request: str) -> str:
 
 def handle_admin(request: str) -> str:
     try:
+        request = request.strip()  # Remove newline
         parts = request.split("|")
         if len(parts) < 2:
             return "ERROR: Invalid ADMIN command"

@@ -333,7 +333,7 @@ def handle_client(client_socket: socket.socket, client_address: tuple) -> None:
             pass
 
 
-def start_server(host: str = 'localhost', port: int = 8080) -> None:
+def start_server(host: str = '0.0.0.0', port: int = 8080) -> None:
     """
     Start the syslog server and listen for client connections.
     
@@ -387,6 +387,6 @@ if __name__ == "__main__":
     if len(sys.argv) > 2:
         host = sys.argv[2]
     else:
-        host = 'localhost'
+        host = '0.0.0.0'
     
     start_server(host, port)
